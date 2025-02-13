@@ -428,12 +428,29 @@ pub fn to_alloy_transaction_with_hash_and_sender(
             gas: t.gas_limit,
             input: t.input.clone().0.into(),
             chain_id: t.chain_id().map(u64::from),
-            signature: None,
+            // Signature fields are zeroed out in the API response for backwards compatibility
+            // https://specs.optimism.io/protocol/deposits.html#the-deposited-transaction-type
+            signature: Some(RpcSignature {
+                r: U256::ZERO,
+                s: U256::ZERO,
+                v: U256::ZERO,
+                y_parity: None,
+            }),
             access_list: None,
-            transaction_type: None,
+            transaction_type: Some(0x7E),
             max_fee_per_blob_gas: None,
             blob_versioned_hashes: None,
-            other: Default::default(),
+            other: {
+                let mut other: alloy_serde::OtherFields = Default::default();
+                other
+                    .insert("sourceHash".to_string(), serde_json::to_value(t.source_hash).unwrap());
+                other.insert("mint".to_string(), serde_json::to_value(t.mint).unwrap());
+                other.insert(
+                    "isSystemTx".to_string(),
+                    serde_json::to_value(t.is_system_tx).unwrap(),
+                );
+                other
+            },
             authorization_list: None,
         },
     }
@@ -1834,5 +1851,65 @@ mod tests {
         let receipt = TypedReceipt::decode(&mut &data[..]).unwrap();
 
         assert_eq!(receipt, expected);
+    }
+
+    #[test]
+    fn test_deposit_tx_to_rpc_tx() {
+        let sender = Address::random();
+        let recipient = Address::random();
+        let send_value = 1_000_000_000_u128;
+        let gas_limit = 21_000_u128;
+        let zero_source_hash =
+            b256!("0000000000000000000000000000000000000000000000000000000000000000");
+
+        let deposit_tx = TypedTransaction::Deposit(DepositTransaction {
+            source_hash: zero_source_hash,
+            from: sender,
+            nonce: 0,
+            kind: TxKind::Call(recipient),
+            mint: U256::from(send_value),
+            value: U256::from(send_value),
+            gas_limit,
+            is_system_tx: false,
+            input: Vec::new().into(),
+        });
+
+        let tx_hash = B256::with_last_byte(0xFF);
+        let rpc_tx: RpcTransaction =
+            to_alloy_transaction_with_hash_and_sender(deposit_tx.clone(), tx_hash, sender);
+
+        // Check all fields are correctly mapped
+        assert_eq!(rpc_tx.hash, tx_hash);
+        assert_eq!(rpc_tx.nonce, deposit_tx.nonce());
+        assert_eq!(rpc_tx.block_hash, None);
+        assert_eq!(rpc_tx.block_number, None);
+        assert_eq!(rpc_tx.transaction_index, None);
+        assert_eq!(rpc_tx.from, sender);
+        assert_eq!(rpc_tx.to, Some(recipient));
+        assert_eq!(rpc_tx.value, U256::from(send_value));
+        assert_eq!(rpc_tx.max_fee_per_gas, None);
+        assert_eq!(rpc_tx.max_priority_fee_per_gas, None);
+        assert_eq!(rpc_tx.gas, gas_limit);
+        assert_eq!(rpc_tx.input, Bytes::from(deposit_tx.data().to_vec()));
+        assert_eq!(rpc_tx.transaction_type, Some(0x7E));
+        assert_eq!(rpc_tx.access_list, None);
+        assert_eq!(rpc_tx.max_fee_per_blob_gas, None);
+        assert_eq!(rpc_tx.blob_versioned_hashes, None);
+
+        assert_eq!(
+            rpc_tx.signature,
+            Some(RpcSignature { r: U256::ZERO, s: U256::ZERO, v: U256::ZERO, y_parity: None })
+        );
+
+        let source_hash: B256 =
+            serde_json::from_value(rpc_tx.other.get("sourceHash").unwrap().clone()).unwrap();
+        assert_eq!(source_hash, zero_source_hash);
+
+        let mint: U256 = serde_json::from_value(rpc_tx.other.get("mint").unwrap().clone()).unwrap();
+        assert_eq!(mint, U256::from(send_value));
+
+        let is_system_tx: bool =
+            serde_json::from_value(rpc_tx.other.get("isSystemTx").unwrap().clone()).unwrap();
+        assert_eq!(is_system_tx, false);
     }
 }
